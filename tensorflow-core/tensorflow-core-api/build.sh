@@ -13,7 +13,11 @@ if [[ -d $BAZEL_VC ]]; then
     export PATH=$PATH:$(pwd)/bazel-tensorflow-core-api/external/mkl_windows/lib/
     export PYTHON_BIN_PATH=$(which python.exe)
 else
-    export BUILD_FLAGS="--copt=-msse4.1 --copt=-msse4.2 --copt=-mavx `#--copt=-mavx2 --copt=-mfma` --cxxopt=-std=c++14 --host_cxxopt=-std=c++14 --linkopt=-lstdc++ --host_linkopt=-lstdc++"
+    if [[ -n "$(grep -l avx2 /proc/cpuinfo)" ]]; then # AVX available on CPU, so build Tensorflow to use AVX
+        export BUILD_FLAGS="--copt=-msse4.1 --copt=-msse4.2 --copt=-mavx `#--copt=-mavx2 --copt=-mfma` --cxxopt=-std=c++14 --host_cxxopt=-std=c++14 --linkopt=-lstdc++ --host_linkopt=-lstdc++"
+    else # AVX unavailable on CPU, so do not build Tensorflow to use AVX
+        export BUILD_FLAGS="--copt=-msse4.1 --copt=-msse4.2 --cxxopt=-std=c++14 --host_cxxopt=-std=c++14 --linkopt=-lstdc++ --host_linkopt=-lstdc++"
+    fi
     export PYTHON_BIN_PATH=$(which python3)
 fi
 
