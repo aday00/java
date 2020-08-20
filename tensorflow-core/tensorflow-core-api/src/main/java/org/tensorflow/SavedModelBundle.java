@@ -20,6 +20,15 @@ import static org.tensorflow.internal.c_api.global.tensorflow.TF_NewGraph;
 import static org.tensorflow.internal.c_api.global.tensorflow.TF_SetConfig;
 
 import com.google.protobuf.InvalidProtocolBufferException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import org.bytedeco.javacpp.BytePointer;
 import org.bytedeco.javacpp.PointerPointer;
 import org.bytedeco.javacpp.PointerScope;
@@ -30,8 +39,16 @@ import org.tensorflow.internal.c_api.TF_Session;
 import org.tensorflow.internal.c_api.TF_SessionOptions;
 import org.tensorflow.internal.c_api.TF_Status;
 import org.tensorflow.proto.framework.ConfigProto;
+import org.tensorflow.proto.framework.DataType;
 import org.tensorflow.proto.framework.MetaGraphDef;
+import org.tensorflow.proto.framework.MetaGraphDef.MetaInfoDef;
 import org.tensorflow.proto.framework.RunOptions;
+import org.tensorflow.proto.framework.SavedModel;
+import org.tensorflow.proto.framework.SignatureDef;
+import org.tensorflow.proto.framework.TensorInfo;
+import org.tensorflow.proto.framework.TensorShapeProto;
+import org.tensorflow.proto.framework.TensorShapeProto.Dim;
+import org.tensorflow.ndarray.Shape;
 
 /**
  * SavedModelBundle represents a model loaded from storage.
@@ -94,6 +111,78 @@ public class SavedModelBundle implements AutoCloseable {
     private RunOptions runOptions = null;
   }
 
+  public static final class Exporter {
+
+    public Exporter withTags(String... tags) {
+      this.tags.addAll(Arrays.asList(tags));
+      return this;
+    }
+
+    public Exporter withSignature(Map<String, Operand<?>> inputs,  Map<String, Operand<?>> outputs) {
+      return withSignature("serving_default", "tensorflow/serving/predict", inputs, outputs);
+    }
+
+    public Exporter withSignature(String signatureName, String methodName, Map<String, Operand<?>> inputs,  Map<String, Operand<?>> outputs) {
+      SignatureDef.Builder signatureDefBuilder = SignatureDef.newBuilder();
+      for (Map.Entry<String, Operand<?>> inputEntry : inputs.entrySet()) {
+        signatureDefBuilder.putInputs(inputEntry.getKey(), toTensorInfo(inputEntry.getValue().asOutput()));
+      }
+      for (Map.Entry<String, Operand<?>> outputEntry : outputs.entrySet()) {
+        signatureDefBuilder.putOutputs(outputEntry.getKey(), toTensorInfo(outputEntry.getValue().asOutput()));
+      }
+      signatureDefBuilder.setMethodName(methodName);
+      metaGraphDefBuilder.putSignatureDef(signatureName, signatureDefBuilder.build());
+      return this;
+    }
+
+    public void export(Session session) throws IOException {
+      Graph graph = session.graph();
+      if (tags.isEmpty()) {
+        tags.add("serve");
+      }
+      // Important: it is imperative to retrieve the graphDef after the saverDef, as the former might add new ops. FIXME Better way for handling this?
+      MetaGraphDef metaGraphDef = metaGraphDefBuilder
+          .setSaverDef(graph.saverDef())
+          .setGraphDef(graph.toGraphDef())
+          .setMetaInfoDef(MetaInfoDef.newBuilder().addAllTags(tags))
+          .build();
+
+      // Make sure saved model directories exist
+      Path variableDir = Paths.get(exportDir, "variables");
+      variableDir.toFile().mkdirs();
+
+      // Save variable state, this must be done before we retrieve the `SaverDef` from the graph
+      session.save(variableDir.resolve("variables").toString());
+
+      // Save graph
+      SavedModel savedModelDef = SavedModel.newBuilder().addMetaGraphs(metaGraphDef).build();
+      try (OutputStream file = new FileOutputStream(Paths.get(exportDir, "saved_model.pb").toString())) {
+        savedModelDef.writeTo(file);
+      }
+    }
+
+    Exporter(String exportDir) {
+      this.exportDir = exportDir;
+    }
+
+    private final String exportDir;
+    private final MetaGraphDef.Builder metaGraphDefBuilder = MetaGraphDef.newBuilder();
+    private final List<String> tags = new ArrayList<>();
+
+    private static TensorInfo toTensorInfo(Output<?> operand) {
+      Shape shape = operand.shape();
+      TensorShapeProto.Builder tensorShapeBuilder = TensorShapeProto.newBuilder();
+      for (int i = 0; i < shape.numDimensions(); ++i) {
+        tensorShapeBuilder.addDim(Dim.newBuilder().setSize(shape.size(i)));
+      }
+      return TensorInfo.newBuilder()
+          .setDtype(DataType.forNumber(operand.dataType().nativeCode()))
+          .setTensorShape(tensorShapeBuilder)
+          .setName(operand.op().name() + ":" + operand.index())
+          .build();
+    }
+  }
+
   /**
    * Load a saved model from an export directory. The model that is being loaded should be created
    * using the <a href="https://www.tensorflow.org/api_docs/python/tf/saved_model">Saved Model
@@ -123,6 +212,10 @@ public class SavedModelBundle implements AutoCloseable {
    */
   public static Loader loader(String exportDir) {
     return new Loader(exportDir);
+  }
+
+  public static Exporter exporter(String exportDir) {
+    return new Exporter(exportDir);
   }
 
   /**
@@ -176,7 +269,7 @@ public class SavedModelBundle implements AutoCloseable {
    */
   private static SavedModelBundle fromHandle(
       TF_Graph graphHandle, TF_Session sessionHandle, MetaGraphDef metaGraphDef) {
-    Graph graph = new Graph(graphHandle);
+    Graph graph = new Graph(graphHandle, metaGraphDef.getSaverDef());
     Session session = new Session(graph, sessionHandle);
     return new SavedModelBundle(graph, session, metaGraphDef);
   }
